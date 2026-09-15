@@ -310,21 +310,7 @@ public class OpenSearchAggregateConstantShiftRuleTests extends BasePlannerRulesT
         );
         RexNode width = castBigint(ref(scan, WIDTH));
         LogicalProject project = project(scan, List.of(plus(width, 1), plus(width, 2), ref(scan, 2), ref(scan, WIDTH)));
-        AggregateCall distinctSum = AggregateCall.create(
-            SqlStdOperatorTable.SUM,
-            true,
-            false,
-            false,
-            List.of(),
-            List.of(3),
-            -1,
-            null,
-            RelCollations.EMPTY,
-            0,
-            project,
-            null,
-            "sum(distinct ResolutionWidth)"
-        );
+        AggregateCall distinctSum = distinctSum(project, 3, "sum(distinct ResolutionWidth)");
         LogicalAggregate input = aggregate(
             project,
             ImmutableBitSet.of(),
@@ -375,13 +361,9 @@ public class OpenSearchAggregateConstantShiftRuleTests extends BasePlannerRulesT
         RelNode result = runDecomposeCollection(input);
 
         LogicalAggregate aggregate = aggregateUnder(result);
-        List<SqlKind> kinds = aggregate.getAggCallList().stream().map(c -> c.getAggregation().getKind()).toList();
-        assertEquals("one SUM(x) shared by the shift and the variance, one COUNT, one SUM(x*x)", 3, kinds.size());
-        assertEquals(List.of(SqlKind.SUM, SqlKind.COUNT, SqlKind.SUM), kinds);
-        LogicalProject scanProject = (LogicalProject) aggregate.getInput();
-        for (RexNode expr : scanProject.getProjects()) {
-            assertFalse("no x ± k column may survive: " + expr, expr.getKind() == SqlKind.PLUS || expr.getKind() == SqlKind.MINUS);
-        }
+        // one SUM(x) shared by the shift and the variance, one COUNT, one SUM(x*x)
+        assertAggCalls(aggregate, SqlKind.SUM, SqlKind.COUNT, SqlKind.SUM);
+        assertNoArithmetic((LogicalProject) aggregate.getInput());
         String plan = RelOptUtil.toString(result);
         assertTrue(plan, plan.contains("sum(ResolutionWidth + 1)=[+($0, $1)]"));
         assertRowTypePreserved(input, result);
@@ -406,22 +388,16 @@ public class OpenSearchAggregateConstantShiftRuleTests extends BasePlannerRulesT
         LogicalAggregate aggregate = aggregateUnder(result);
         // SUM(x), SUM(y), SUM(y*y) plus ONE COUNT: on the NOT NULL mock columns COUNT(x) and COUNT(y) both fold to COUNT()
         // and dedup into a single accumulator (on nullable columns they stay COUNT(x) / COUNT(y)).
-        assertEquals(4, aggregate.getAggCallList().size());
-        assertEquals(
-            List.of(SqlKind.SUM, SqlKind.COUNT, SqlKind.SUM, SqlKind.SUM),
-            aggregate.getAggCallList().stream().map(c -> c.getAggregation().getKind()).toList()
-        );
+        assertAggCalls(aggregate, SqlKind.SUM, SqlKind.COUNT, SqlKind.SUM, SqlKind.SUM);
         LogicalProject scanProject = (LogicalProject) aggregate.getInput();
         assertEquals("x (widened), y, y*y — nothing else", 3, scanProject.getProjects().size());
-        for (RexNode expr : scanProject.getProjects()) {
-            assertFalse("no x ± k column may survive: " + expr, expr.getKind() == SqlKind.PLUS || expr.getKind() == SqlKind.MINUS);
-        }
+        assertNoArithmetic(scanProject);
         String plan = RelOptUtil.toString(result);
         assertTrue(plan, plan.contains("sum(ResolutionWidth + 2)=[+($"));
         assertRowTypePreserved(input, result);
     }
 
-    // ── overflow safety for MIN / MAX ─────────────────────────────────────────
+    // ── overflow safety for MIN / MAX (positive control: testMinMaxOnlyQueryIsRewritten, SMALLINT base, k = 5) ──
 
     public void testMinMaxOverBigintBaseAreNotShifted() {
         // min(big + k) over a BIGINT column: a row may wrap, and the order of wrapped values is not the order of the
@@ -472,23 +448,6 @@ public class OpenSearchAggregateConstantShiftRuleTests extends BasePlannerRulesT
                 call(SqlStdOperatorTable.MAX, project, List.of(0), "max(x + huge)", 0)
             )
         );
-    }
-
-    public void testMinMaxOverNarrowBaseWithOrdinaryShiftAreShifted() {
-        // min(x + 5) over a SMALLINT column cannot wrap: 2^15 + 5 is far inside the 64-bit range.
-        TableScan scan = scan();
-        LogicalProject project = project(scan, List.of(plus(castBigint(ref(scan, WIDTH)), 5)));
-        LogicalAggregate input = aggregate(
-            project,
-            ImmutableBitSet.of(),
-            call(SqlStdOperatorTable.MIN, project, List.of(0), "min(x + 5)", 0),
-            call(SqlStdOperatorTable.MAX, project, List.of(0), "max(x + 5)", 0)
-        );
-        RelNode result = runRule(input);
-        assertAggCalls(aggregateUnder(result), SqlKind.MIN, SqlKind.MAX);
-        String plan = RelOptUtil.toString(result);
-        assertTrue(plan, plan.contains("min(x + 5)=[+($0, 5)]"));
-        assertTrue(plan, plan.contains("max(x + 5)=[+($1, 5)]"));
     }
 
     // ── known limitation: x ± k computed below another operator ─────────────────
@@ -581,23 +540,8 @@ public class OpenSearchAggregateConstantShiftRuleTests extends BasePlannerRulesT
         // textually identical but independent draws. Unifying them into one base column would correlate the results
         // (s2 - s1 would always equal the row count), so non-deterministic bases never take part — shifted or not.
         TableScan scan = scan();
-        RelDataType bigint = typeFactory.createSqlType(SqlTypeName.BIGINT);
-        RexNode draw1 = rexBuilder.makeCast(
-            bigint,
-            rexBuilder.makeCall(
-                SqlStdOperatorTable.MULTIPLY,
-                rexBuilder.makeCall(SqlStdOperatorTable.RAND),
-                rexBuilder.makeExactLiteral(BigDecimal.valueOf(1000000))
-            )
-        );
-        RexNode draw2 = rexBuilder.makeCast(
-            bigint,
-            rexBuilder.makeCall(
-                SqlStdOperatorTable.MULTIPLY,
-                rexBuilder.makeCall(SqlStdOperatorTable.RAND),
-                rexBuilder.makeExactLiteral(BigDecimal.valueOf(1000000))
-            )
-        );
+        RexNode draw1 = randDraw();
+        RexNode draw2 = randDraw();
         LogicalProject project = project(scan, List.of(plus(draw1, 1), plus(draw2, 2), draw1));
         assertNotRewritten(
             aggregate(
@@ -667,22 +611,7 @@ public class OpenSearchAggregateConstantShiftRuleTests extends BasePlannerRulesT
     public void testDistinctSumNotRewritten() {
         TableScan scan = scan();
         LogicalProject project = project(scan, List.of(plus(castBigint(ref(scan, WIDTH)), 1)));
-        AggregateCall distinctSum = AggregateCall.create(
-            SqlStdOperatorTable.SUM,
-            true,
-            false,
-            false,
-            List.of(),
-            List.of(0),
-            -1,
-            null,
-            RelCollations.EMPTY,
-            0,
-            project,
-            null,
-            "sum(distinct RW+1)"
-        );
-        assertNotRewritten(aggregate(project, ImmutableBitSet.of(), distinctSum));
+        assertNotRewritten(aggregate(project, ImmutableBitSet.of(), distinctSum(project, 0, "sum(distinct RW+1)")));
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────────
@@ -729,6 +658,18 @@ public class OpenSearchAggregateConstantShiftRuleTests extends BasePlannerRulesT
         return rexBuilder.makeCast(bigint, node);
     }
 
+    /** {@code CAST(RAND() * 1000000):BIGINT}: an integer-typed argument that is a fresh draw per call site. */
+    private RexNode randDraw() {
+        return rexBuilder.makeCast(
+            typeFactory.createSqlType(SqlTypeName.BIGINT),
+            rexBuilder.makeCall(
+                SqlStdOperatorTable.MULTIPLY,
+                rexBuilder.makeCall(SqlStdOperatorTable.RAND),
+                rexBuilder.makeExactLiteral(BigDecimal.valueOf(1000000))
+            )
+        );
+    }
+
     private RexNode plus(RexNode node, int k) {
         return rexBuilder.makeCall(SqlStdOperatorTable.PLUS, node, rexBuilder.makeExactLiteral(BigDecimal.valueOf(k)));
     }
@@ -755,9 +696,18 @@ public class OpenSearchAggregateConstantShiftRuleTests extends BasePlannerRulesT
     }
 
     private AggregateCall call(SqlAggFunction function, RelNode input, List<Integer> args, String name, int groupCount) {
+        return call(function, false, input, args, name, groupCount);
+    }
+
+    /** {@code SUM(DISTINCT arg)}: never takes part, whatever the argument looks like. */
+    private AggregateCall distinctSum(RelNode input, int arg, String name) {
+        return call(SqlStdOperatorTable.SUM, true, input, List.of(arg), name, 0);
+    }
+
+    private AggregateCall call(SqlAggFunction function, boolean distinct, RelNode input, List<Integer> args, String name, int groupCount) {
         return AggregateCall.create(
             function,
-            false,
+            distinct,
             false,
             false,
             List.of(),

@@ -31,6 +31,7 @@ import org.apache.calcite.tools.RelBuilder;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -123,9 +124,9 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
         RelBuilder relBuilder = call.builder();
 
         ShiftedCall[] shifted = classify(aggregate, project);
-        InputProject input = projectWithBases(relBuilder, project, unifyBases(shifted));
-        CallRegistry registry = new CallRegistry(aggregate.getCluster().getRexBuilder(), input.node(), aggregate.getGroupCount());
-        List<RexNode> outputs = recomposeOutputs(aggregate, shifted, input.baseSlot(), registry);
+        Map<String, Integer> baseSlot = projectWithBases(relBuilder, project, unifyBases(shifted));
+        CallRegistry registry = new CallRegistry(aggregate.getCluster().getRexBuilder(), relBuilder.peek(), aggregate.getGroupCount());
+        List<RexNode> outputs = recomposeOutputs(aggregate, shifted, baseSlot, registry);
 
         call.transformTo(
             relBuilder.aggregate(relBuilder.groupKey(aggregate.getGroupSet()), registry.calls())
@@ -146,9 +147,12 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
         return shifted;
     }
 
-    /** {@code x}, {@code CAST(x):BIGINT} and {@code CAST(x):INTEGER} are one base; keep the variant the others widen into. */
+    /**
+     * {@code x}, {@code CAST(x):BIGINT} and {@code CAST(x):INTEGER} are one base; keep the variant the others widen into.
+     * Insertion-ordered so base columns land in the order the query first mentions them.
+     */
     private static Map<String, RexNode> unifyBases(ShiftedCall[] shifted) {
-        Map<String, RexNode> baseByKey = new HashMap<>();
+        Map<String, RexNode> baseByKey = new LinkedHashMap<>();
         for (ShiftedCall sc : shifted) {
             if (sc != null) {
                 baseByKey.merge(baseKey(sc.base()), sc.base(), OpenSearchAggregateConstantShiftRule::widerOf);
@@ -157,15 +161,12 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
         return baseByKey;
     }
 
-    /** The rewritten input Project (left on the builder's stack) and the slot each base column landed in. */
-    private record InputProject(RelNode node, Map<String, Integer> baseSlot) {
-    }
-
     /**
-     * The original columns plus one per base. {@link RelBuilder#aggregate} later prunes the {@code x ± k} columns
-     * nobody reads any more, so this does not have to.
+     * Pushes the rewritten input Project (the original columns plus one per base) onto the builder and returns the
+     * slot each base landed in. {@link RelBuilder#aggregate} later prunes the {@code x ± k} columns nobody reads any
+     * more, so this does not have to.
      */
-    private static InputProject projectWithBases(RelBuilder relBuilder, LogicalProject project, Map<String, RexNode> baseByKey) {
+    private static Map<String, Integer> projectWithBases(RelBuilder relBuilder, LogicalProject project, Map<String, RexNode> baseByKey) {
         List<RexNode> exprs = new ArrayList<>(project.getProjects());
         List<String> names = new ArrayList<>(project.getRowType().getFieldNames());
         Map<String, Integer> baseSlot = new HashMap<>();
@@ -178,7 +179,8 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
             }
             baseSlot.put(base.getKey(), slot);
         }
-        return new InputProject(relBuilder.push(project.getInput()).project(exprs, names, true).peek(), baseSlot);
+        relBuilder.push(project.getInput()).project(exprs, names, true);
+        return baseSlot;
     }
 
     /**
@@ -261,9 +263,25 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
             return rexBuilder.addAggCall(call, groupCount, calls, refs, input::fieldIsNullable);
         }
 
-        /** Registers plain {@code fn(input column slot)}, typed from {@code input}. */
+        /** Registers plain {@code fn(input column slot)}: no DISTINCT / FILTER / collation, type inferred from {@code input}. */
         RexNode primitive(SqlAggFunction fn, int slot) {
-            return register(newAggCall(fn, slot, groupCount, input));
+            return register(
+                AggregateCall.create(
+                    fn,
+                    false,
+                    false,
+                    false,
+                    List.of(),
+                    List.of(slot),
+                    -1,
+                    null,
+                    RelCollations.EMPTY,
+                    groupCount,
+                    input,
+                    null,
+                    null
+                )
+            );
         }
 
         List<AggregateCall> calls() {
@@ -290,7 +308,7 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
                 || ac.isDistinct()
                 || ac.distinctKeys != null
                 || ac.isApproximate()
-                || ac.filterArg >= 0
+                || ac.hasFilter()
                 || ac.getArgList().size() != 1) {
                 return null;
             }
@@ -333,13 +351,17 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
 
     // ---- Base unification ----
 
-    /** Identity of a base with lossless casts stripped, so {@code x} and {@code CAST(x):BIGINT} map to one key. */
-    private static String baseKey(RexNode base) {
-        RexNode node = base;
+    /** {@code node} with lossless casts stripped, so {@code CAST(x):BIGINT} and {@code x} become the same expression. */
+    private static RexNode stripLosslessCasts(RexNode node) {
         while (node.getKind() == SqlKind.CAST && RexUtil.isLosslessCast(node)) {
             node = ((RexCall) node).getOperands().get(0);
         }
-        return node.toString();
+        return node;
+    }
+
+    /** Identity of a base with lossless casts stripped, so {@code x} and {@code CAST(x):BIGINT} map to one key. */
+    private static String baseKey(RexNode base) {
+        return stripLosslessCasts(base).toString();
     }
 
     /** Of two variants of one base, the one the other converts into without loss. */
@@ -348,25 +370,6 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
     }
 
     // ---- Small helpers ----
-
-    /** Plain {@code fn(arg)}: no DISTINCT / FILTER / collation, type inferred from {@code input}. */
-    private static AggregateCall newAggCall(SqlAggFunction fn, int arg, int groupCount, RelNode input) {
-        return AggregateCall.create(
-            fn,
-            false,
-            false,
-            false,
-            List.of(),
-            List.of(arg),
-            -1,
-            null,
-            RelCollations.EMPTY,
-            groupCount,
-            input,
-            null,
-            null
-        );
-    }
 
     /** A non-null integer literal, possibly wrapped in casts that keep it integer. */
     private static boolean isIntegerLiteral(RexNode node) {
@@ -391,11 +394,7 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
      * {@code k}, a BIGINT column only for {@code k == 0}.
      */
     private static boolean fitsWithoutOverflow(RexNode base, BigDecimal shift) {
-        RexNode node = base;
-        while (node.getKind() == SqlKind.CAST && RexUtil.isLosslessCast(node)) {
-            node = ((RexCall) node).getOperands().get(0);
-        }
-        BigDecimal bound = switch (node.getType().getSqlTypeName()) {
+        BigDecimal bound = switch (stripLosslessCasts(base).getType().getSqlTypeName()) {
             case TINYINT -> BigDecimal.valueOf(Byte.MAX_VALUE + 1L);
             case SMALLINT -> BigDecimal.valueOf(Short.MAX_VALUE + 1L);
             case INTEGER -> BigDecimal.valueOf(Integer.MAX_VALUE + 1L);
