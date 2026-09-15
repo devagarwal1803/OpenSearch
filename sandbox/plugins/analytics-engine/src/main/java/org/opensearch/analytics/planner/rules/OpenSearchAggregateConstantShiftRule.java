@@ -100,36 +100,40 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
         if (aggregate.getGroupType() != Aggregate.Group.SIMPLE) {
             return false;
         }
-        for (AggregateCall ac : aggregate.getAggCallList()) {
-            if (!ac.rexList.isEmpty()) {
+        for (AggregateCall aggCall : aggregate.getAggCallList()) {
+            if (!aggCall.rexList.isEmpty()) {
                 return false;
             }
         }
         // At least one supported call over x ± k with k != 0. Also what stops the rule from re-firing on its
         // own output, whose calls are all shift 0.
-        for (AggregateCall ac : aggregate.getAggCallList()) {
-            ShiftedCall sc = ShiftedCall.of(ac, project);
-            if (sc != null && sc.shift().signum() != 0) {
+        for (AggregateCall aggCall : aggregate.getAggCallList()) {
+            AggregateTerm term = AggregateTerm.of(aggCall, project);
+            if (term != null && term.isShifted()) {
                 return true;
             }
         }
         return false;
     }
 
-    /** {@code Project(recomposed outputs) / Aggregate(shared primitives) / Project(original columns + bases)}. */
+    /** {@code Project(recomposed outputs) / Aggregate(shared accumulators) / Project(original columns + bases)}. */
     @Override
     public void onMatch(RelOptRuleCall call) {
         LogicalAggregate aggregate = call.rel(0);
         LogicalProject project = call.rel(1);
         RelBuilder relBuilder = call.builder();
 
-        ShiftedCall[] shifted = classify(aggregate, project);
-        Map<String, Integer> baseSlot = projectWithBases(relBuilder, project, unifyBases(shifted));
-        CallRegistry registry = new CallRegistry(aggregate.getCluster().getRexBuilder(), relBuilder.peek(), aggregate.getGroupCount());
-        List<RexNode> outputs = recomposeOutputs(aggregate, shifted, baseSlot, registry);
+        AggregateTerm[] terms = termsOf(aggregate, project);
+        Map<String, Integer> slotByBaseKey = appendBaseColumns(relBuilder, project, sharedBases(terms));
+        SharedAccumulators accumulators = new SharedAccumulators(
+            aggregate.getCluster().getRexBuilder(),
+            relBuilder.peek(),
+            aggregate.getGroupCount()
+        );
+        List<RexNode> outputs = recomposeOutputs(aggregate, terms, slotByBaseKey, accumulators);
 
         call.transformTo(
-            relBuilder.aggregate(relBuilder.groupKey(aggregate.getGroupSet()), registry.calls())
+            relBuilder.aggregate(relBuilder.groupKey(aggregate.getGroupSet()), accumulators.calls())
                 .project(outputs, aggregate.getRowType().getFieldNames(), true)
                 .build()
         );
@@ -137,39 +141,39 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
 
     // ---- Rewrite steps ----
 
-    /** Classifies every call once; {@code null} where a call does not take part (kept as-is, remapped by RelBuilder). */
-    private static ShiftedCall[] classify(LogicalAggregate aggregate, LogicalProject project) {
+    /** One term per call, in call order; {@code null} where a call does not take part (kept as-is, remapped by RelBuilder). */
+    private static AggregateTerm[] termsOf(LogicalAggregate aggregate, LogicalProject project) {
         List<AggregateCall> calls = aggregate.getAggCallList();
-        ShiftedCall[] shifted = new ShiftedCall[calls.size()];
+        AggregateTerm[] terms = new AggregateTerm[calls.size()];
         for (int i = 0; i < calls.size(); i++) {
-            shifted[i] = ShiftedCall.of(calls.get(i), project);
+            terms[i] = AggregateTerm.of(calls.get(i), project);
         }
-        return shifted;
+        return terms;
     }
 
     /**
      * {@code x}, {@code CAST(x):BIGINT} and {@code CAST(x):INTEGER} are one base; keep the variant the others widen into.
      * Insertion-ordered so base columns land in the order the query first mentions them.
      */
-    private static Map<String, RexNode> unifyBases(ShiftedCall[] shifted) {
+    private static Map<String, RexNode> sharedBases(AggregateTerm[] terms) {
         Map<String, RexNode> baseByKey = new LinkedHashMap<>();
-        for (ShiftedCall sc : shifted) {
-            if (sc != null) {
-                baseByKey.merge(baseKey(sc.base()), sc.base(), OpenSearchAggregateConstantShiftRule::widerOf);
+        for (AggregateTerm term : terms) {
+            if (term != null) {
+                baseByKey.merge(baseKey(term.base()), term.base(), OpenSearchAggregateConstantShiftRule::widerOf);
             }
         }
         return baseByKey;
     }
 
     /**
-     * Pushes the rewritten input Project (the original columns plus one per base) onto the builder and returns the
-     * slot each base landed in. {@link RelBuilder#aggregate} later prunes the {@code x ± k} columns nobody reads any
-     * more, so this does not have to.
+     * Pushes the rewritten input Project (the original columns plus one per base) onto the builder — the caller reads
+     * it back with {@link RelBuilder#peek()} — and returns the slot each base landed in, keyed by {@link #baseKey}.
+     * {@link RelBuilder#aggregate} later prunes the {@code x ± k} columns nobody reads any more, so this does not have to.
      */
-    private static Map<String, Integer> projectWithBases(RelBuilder relBuilder, LogicalProject project, Map<String, RexNode> baseByKey) {
+    private static Map<String, Integer> appendBaseColumns(RelBuilder relBuilder, LogicalProject project, Map<String, RexNode> baseByKey) {
         List<RexNode> exprs = new ArrayList<>(project.getProjects());
         List<String> names = new ArrayList<>(project.getRowType().getFieldNames());
-        Map<String, Integer> baseSlot = new HashMap<>();
+        Map<String, Integer> slotByBaseKey = new HashMap<>();
         for (Map.Entry<String, RexNode> base : baseByKey.entrySet()) {
             int slot = exprs.indexOf(base.getValue());
             if (slot < 0) {
@@ -177,59 +181,62 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
                 exprs.add(base.getValue());
                 names.add(null);
             }
-            baseSlot.put(base.getKey(), slot);
+            slotByBaseKey.put(base.getKey(), slot);
         }
         relBuilder.push(project.getInput()).project(exprs, names, true);
-        return baseSlot;
+        return slotByBaseKey;
     }
 
     /**
      * One expression per original output column: group keys pass through; aggregates are recomposed from the
-     * shared primitives or, when they do not take part, re-registered unchanged. Output types are restored either way.
+     * shared accumulators or, when they do not take part, re-registered unchanged. Output types are restored either way.
      */
     private static List<RexNode> recomposeOutputs(
         LogicalAggregate aggregate,
-        ShiftedCall[] shifted,
-        Map<String, Integer> baseSlot,
-        CallRegistry registry
+        AggregateTerm[] terms,
+        Map<String, Integer> slotByBaseKey,
+        SharedAccumulators accumulators
     ) {
         int groupCount = aggregate.getGroupCount();
         List<RexNode> outputs = new ArrayList<>();
         for (int key = 0; key < groupCount; key++) {
-            outputs.add(registry.rexBuilder().makeInputRef(outputType(aggregate, key), key));
+            outputs.add(accumulators.rexBuilder().makeInputRef(outputType(aggregate, key), key));
         }
         List<AggregateCall> originals = aggregate.getAggCallList();
         for (int i = 0; i < originals.size(); i++) {
-            ShiftedCall sc = shifted[i];
-            RexNode value = sc == null ? registry.register(originals.get(i)) : recompose(sc, baseSlot.get(baseKey(sc.base())), registry);
-            outputs.add(castTo(outputType(aggregate, groupCount + i), value, registry.rexBuilder()));
+            AggregateTerm term = terms[i];
+            RexNode value = term == null
+                ? accumulators.share(originals.get(i))
+                : recompose(term, slotByBaseKey.get(baseKey(term.base())), accumulators);
+            outputs.add(castTo(outputType(aggregate, groupCount + i), value, accumulators.rexBuilder()));
         }
         return outputs;
     }
 
     /**
      * {@code fn(base ± k)} from the shared {@code fn(base)}: SUM shifts by {@code k} per counted row, MIN / MAX by
-     * {@code k} once, COUNT is shift-invariant. A shift-0 call is the shared primitive itself.
+     * {@code k} once, COUNT is shift-invariant. An unshifted term is the shared accumulator itself.
      */
-    private static RexNode recompose(ShiftedCall sc, int slot, CallRegistry registry) {
-        RexNode aggregated = registry.primitive(sc.function(), slot);
-        if (sc.shift().signum() == 0 || sc.function() == SqlStdOperatorTable.COUNT) {
+    private static RexNode recompose(AggregateTerm term, int slot, SharedAccumulators accumulators) {
+        RexNode aggregated = accumulators.accumulator(term.function(), slot);
+        if (!term.isShifted() || term.function() == SqlStdOperatorTable.COUNT) {
             return aggregated;
         }
-        BigDecimal k = sc.shift().abs();
-        RexNode delta = sc.function() == SqlStdOperatorTable.SUM
-            ? scaledCount(k, slot, registry)
-            : registry.rexBuilder().makeExactLiteral(k);
-        return registry.rexBuilder()
-            .makeCall(sc.shift().signum() > 0 ? SqlStdOperatorTable.PLUS : SqlStdOperatorTable.MINUS, aggregated, delta);
+        BigDecimal magnitude = term.offset().abs();
+        RexNode correction = term.function() == SqlStdOperatorTable.SUM
+            ? scaledCount(magnitude, slot, accumulators)
+            : accumulators.rexBuilder().makeExactLiteral(magnitude);
+        return accumulators.rexBuilder()
+            .makeCall(term.offset().signum() > 0 ? SqlStdOperatorTable.PLUS : SqlStdOperatorTable.MINUS, aggregated, correction);
     }
 
-    /** {@code k * COUNT(base)}, or just {@code COUNT(base)} when {@code k == 1}. */
-    private static RexNode scaledCount(BigDecimal k, int slot, CallRegistry registry) {
-        RexNode count = registry.primitive(SqlStdOperatorTable.COUNT, slot);
-        return k.compareTo(BigDecimal.ONE) == 0
+    /** {@code magnitude * COUNT(base)}, or just {@code COUNT(base)} when {@code magnitude == 1}. */
+    private static RexNode scaledCount(BigDecimal magnitude, int slot, SharedAccumulators accumulators) {
+        RexNode count = accumulators.accumulator(SqlStdOperatorTable.COUNT, slot);
+        return magnitude.compareTo(BigDecimal.ONE) == 0
             ? count
-            : registry.rexBuilder().makeCall(SqlStdOperatorTable.MULTIPLY, registry.rexBuilder().makeExactLiteral(k), count);
+            : accumulators.rexBuilder()
+                .makeCall(SqlStdOperatorTable.MULTIPLY, accumulators.rexBuilder().makeExactLiteral(magnitude), count);
     }
 
     /** The recomposition may widen (BIGINT sum over a SMALLINT base); restore the declared output type. */
@@ -242,30 +249,30 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
     }
 
     /**
-     * The rewritten aggregate's call list. {@link RexBuilder#addAggCall} adds a call once and hands back a reference
-     * to its output column, so N terms over one base cost one accumulator per primitive.
+     * The rewritten aggregate's call list, deduplicated: {@link RexBuilder#addAggCall} adds a call once and hands back
+     * a reference to its output column, so N terms over one base cost one accumulator per function.
      */
-    private static final class CallRegistry {
+    private static final class SharedAccumulators {
         private final RexBuilder rexBuilder;
         private final RelNode input;
         private final int groupCount;
         private final List<AggregateCall> calls = new ArrayList<>();
-        private final Map<AggregateCall, RexNode> refs = new HashMap<>();
+        private final Map<AggregateCall, RexNode> outputRefs = new HashMap<>();
 
-        CallRegistry(RexBuilder rexBuilder, RelNode input, int groupCount) {
+        SharedAccumulators(RexBuilder rexBuilder, RelNode input, int groupCount) {
             this.rexBuilder = rexBuilder;
             this.input = input;
             this.groupCount = groupCount;
         }
 
-        /** Adds {@code call} unless an identical one is already registered; returns the reference to its output. */
-        RexNode register(AggregateCall call) {
-            return rexBuilder.addAggCall(call, groupCount, calls, refs, input::fieldIsNullable);
+        /** Adds {@code call} unless an identical one is already present; returns the reference to its output column. */
+        RexNode share(AggregateCall call) {
+            return rexBuilder.addAggCall(call, groupCount, calls, outputRefs, input::fieldIsNullable);
         }
 
-        /** Registers plain {@code fn(input column slot)}: no DISTINCT / FILTER / collation, type inferred from {@code input}. */
-        RexNode primitive(SqlAggFunction fn, int slot) {
-            return register(
+        /** The shared plain {@code fn(input column slot)}: no DISTINCT / FILTER / collation, type inferred from {@code input}. */
+        RexNode accumulator(SqlAggFunction fn, int slot) {
+            return share(
                 AggregateCall.create(
                     fn,
                     false,
@@ -296,24 +303,29 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
     // ---- Call classification ----
 
     /**
-     * {@code function(base ± shift)}: an integer expression moved by an integer literal. A plain
-     * {@code function(base)} is a {@code ShiftedCall} with {@code shift == 0} so it can share the base's
-     * accumulators with its shifted siblings.
+     * One aggregate call that takes part in the rewrite, seen as {@code function(base ± offset)}: an integer
+     * expression moved by an integer literal. A plain {@code function(base)} is a term with {@code offset == 0}
+     * ({@link #isShifted()} is false) so it can share the base's accumulators with its shifted siblings.
      */
-    private record ShiftedCall(SqlAggFunction function, RexNode base, BigDecimal shift) {
+    private record AggregateTerm(SqlAggFunction function, RexNode base, BigDecimal offset) {
+
+        /** Whether the argument really is {@code base ± k} with {@code k != 0}; false for a plain {@code function(base)}. */
+        boolean isShifted() {
+            return offset.signum() != 0;
+        }
 
         /** Recognizes {@code fn(x + k)}, {@code fn(k + x)}, {@code fn(x - k)} and plain integer {@code fn(x)}; null otherwise. */
-        static ShiftedCall of(AggregateCall ac, LogicalProject project) {
-            if (!SUPPORTED_FUNCTIONS.contains(ac.getAggregation())
-                || ac.isDistinct()
-                || ac.distinctKeys != null
-                || ac.isApproximate()
-                || ac.hasFilter()
-                || ac.getArgList().size() != 1) {
+        static AggregateTerm of(AggregateCall call, LogicalProject project) {
+            if (!SUPPORTED_FUNCTIONS.contains(call.getAggregation())
+                || call.isDistinct()
+                || call.distinctKeys != null
+                || call.isApproximate()
+                || call.hasFilter()
+                || call.getArgList().size() != 1) {
                 return null;
             }
-            SqlAggFunction fn = ac.getAggregation();
-            RexNode arg = project.getProjects().get(ac.getArgList().get(0));
+            SqlAggFunction fn = call.getAggregation();
+            RexNode arg = project.getProjects().get(call.getArgList().get(0));
             // Bases are unified by expression text, which is only sound for deterministic expressions: two
             // independent RAND() calls must stay two draws, not one shared column.
             if (!RexUtil.isDeterministic(arg)) {
@@ -322,30 +334,30 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
             if (!(arg instanceof RexCall arithmetic)
                 || arithmetic.getOperands().size() != 2
                 || (arithmetic.getKind() != SqlKind.PLUS && arithmetic.getKind() != SqlKind.MINUS)) {
-                // Not an arithmetic argument: a plain integer column takes part with shift 0.
-                return isIntegerType(arg.getType()) ? new ShiftedCall(fn, arg, BigDecimal.ZERO) : null;
+                // Not an arithmetic argument: a plain integer column takes part with offset 0.
+                return isIntegerType(arg.getType()) ? new AggregateTerm(fn, arg, BigDecimal.ZERO) : null;
             }
             RexNode left = arithmetic.getOperands().get(0);
             RexNode right = arithmetic.getOperands().get(1);
             boolean minus = arithmetic.getKind() == SqlKind.MINUS;
-            ShiftedCall shifted = null;
+            AggregateTerm term = null;
             if (isIntegerLiteral(right) && isIntegerType(left.getType())) {
                 BigDecimal k = literalValue(right);
-                shifted = new ShiftedCall(fn, left, minus ? k.negate() : k);
+                term = new AggregateTerm(fn, left, minus ? k.negate() : k);
             } else if (!minus && isIntegerLiteral(left) && isIntegerType(right.getType())) {
-                shifted = new ShiftedCall(fn, right, literalValue(left));
+                term = new AggregateTerm(fn, right, literalValue(left));
             }
             // k - x (needs -x, a scale), x + y (no literal), x + 1.5 (not integer): leave as written.
-            if (shifted == null) {
+            if (term == null) {
                 return null;
             }
             // Per-row x ± k wraps silently on overflow. SUM and COUNT survive that (wrapping addition commutes with
             // the identity), MIN / MAX do not: the order of wrapped values is not the order of the originals. Hoist
             // MIN / MAX only when no row can overflow, which the base type's range guarantees for small enough k.
-            if ((fn == SqlStdOperatorTable.MIN || fn == SqlStdOperatorTable.MAX) && !fitsWithoutOverflow(shifted.base(), shifted.shift())) {
+            if ((fn == SqlStdOperatorTable.MIN || fn == SqlStdOperatorTable.MAX) && !fitsWithoutOverflow(term.base(), term.offset())) {
                 return null;
             }
-            return shifted;
+            return term;
         }
     }
 
@@ -389,11 +401,11 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
     }
 
     /**
-     * Whether {@code base ± shift} stays inside the 64-bit range for every possible value of {@code base}, judged
+     * Whether {@code base ± offset} stays inside the 64-bit range for every possible value of {@code base}, judged
      * from the base's own type (lossless casts stripped): a SMALLINT or INTEGER column has room for any practical
      * {@code k}, a BIGINT column only for {@code k == 0}.
      */
-    private static boolean fitsWithoutOverflow(RexNode base, BigDecimal shift) {
+    private static boolean fitsWithoutOverflow(RexNode base, BigDecimal offset) {
         BigDecimal bound = switch (stripLosslessCasts(base).getType().getSqlTypeName()) {
             case TINYINT -> BigDecimal.valueOf(Byte.MAX_VALUE + 1L);
             case SMALLINT -> BigDecimal.valueOf(Short.MAX_VALUE + 1L);
@@ -401,6 +413,6 @@ public class OpenSearchAggregateConstantShiftRule extends RelOptRule {
             default -> BigDecimal.valueOf(Long.MAX_VALUE);
         };
         // |base| <= bound, so |base ± k| <= bound + |k| must not exceed Long.MAX_VALUE.
-        return bound.add(shift.abs()).compareTo(BigDecimal.valueOf(Long.MAX_VALUE)) <= 0;
+        return bound.add(offset.abs()).compareTo(BigDecimal.valueOf(Long.MAX_VALUE)) <= 0;
     }
 }
