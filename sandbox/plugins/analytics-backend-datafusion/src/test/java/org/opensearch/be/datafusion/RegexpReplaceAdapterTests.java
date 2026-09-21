@@ -165,10 +165,11 @@ public class RegexpReplaceAdapterTests extends OpenSearchTestCase {
         assertEquals("Java \\Q…\\E rewritten to plain regex", "^BUSINESS(.*?)$", ((RexLiteral) newPatternNode).getValueAs(String.class));
     }
 
-    public void testAdaptAppendsGlobalFlagFor3Arg() {
+    public void testAdaptAppendsGlobalFlagForUnanchoredPattern() {
+        // 'at' can match several times in one value ('cat hat bat'), so replace-all needs "g".
         RexNode field = rexBuilder.makeInputRef(varcharType, 0);
-        RexNode pattern = rexBuilder.makeLiteral("^OFFICE.*$");
-        RexNode replacement = rexBuilder.makeLiteral("OFC");
+        RexNode pattern = rexBuilder.makeLiteral("at");
+        RexNode replacement = rexBuilder.makeLiteral("og");
         RexCall original = (RexCall) rexBuilder.makeCall(SqlLibraryOperators.REGEXP_REPLACE_3, List.of(field, pattern, replacement));
 
         RexCall adapted = (RexCall) adapter.adapt(original, List.of(), cluster);
@@ -177,6 +178,159 @@ public class RegexpReplaceAdapterTests extends OpenSearchTestCase {
         assertEquals("4 operands after append", 4, adapted.getOperands().size());
         assertTrue("trailing operand is a literal", adapted.getOperands().get(3) instanceof RexLiteral);
         assertEquals("trailing flag is \"g\"", "g", ((RexLiteral) adapted.getOperands().get(3)).getValueAs(String.class));
+    }
+
+    public void testAdaptOmitsGlobalFlagForAnchoredPattern() {
+        // '^OFFICE.*$' matches at most once, so the 3-arg (first-match) form returns the same value
+        // as replace-all and is the form DataFusion optimizes. Nothing else needs rewriting, so the
+        // call passes through untouched.
+        RexNode field = rexBuilder.makeInputRef(varcharType, 0);
+        RexNode pattern = rexBuilder.makeLiteral("^OFFICE.*$");
+        RexNode replacement = rexBuilder.makeLiteral("OFC");
+        RexCall original = (RexCall) rexBuilder.makeCall(SqlLibraryOperators.REGEXP_REPLACE_3, List.of(field, pattern, replacement));
+
+        RexNode adapted = adapter.adapt(original, List.of(), cluster);
+
+        assertSame("identity: anchored pattern, no \\Q, no $N", original, adapted);
+    }
+
+    public void testAdaptOmitsGlobalFlagForAnchoredPatternWithBackreference() {
+        // Anchored pattern plus a $1 replacement: the replacement is braced, the operator stays
+        // REGEXP_REPLACE_3 and no flag operand is added.
+        RexNode field = rexBuilder.makeInputRef(varcharType, 0);
+        RexNode pattern = rexBuilder.makeLiteral("^https?://(?:www\\.)?([^/]+)/.*$");
+        RexNode replacement = rexBuilder.makeLiteral("$1");
+        RexCall original = (RexCall) rexBuilder.makeCall(SqlLibraryOperators.REGEXP_REPLACE_3, List.of(field, pattern, replacement));
+
+        RexCall adapted = (RexCall) adapter.adapt(original, List.of(), cluster);
+
+        assertSame("operator stays REGEXP_REPLACE_3", SqlLibraryOperators.REGEXP_REPLACE_3, adapted.getOperator());
+        assertEquals("3 operands, no flag appended", 3, adapted.getOperands().size());
+        assertEquals("replacement braced", "${1}", ((RexLiteral) adapted.getOperands().get(2)).getValueAs(String.class));
+    }
+
+    public void testAdaptOmitsGlobalFlagWhenUnquotedPatternIsAnchored() {
+        // The anchor check runs on the \Q…\E-expanded pattern, which is what DataFusion compiles.
+        RexNode field = rexBuilder.makeInputRef(varcharType, 0);
+        RexNode pattern = rexBuilder.makeLiteral("^\\QBUSINESS\\E(.*?)\\Q\\E$");
+        RexNode replacement = rexBuilder.makeLiteral("BIZ");
+        RexCall original = (RexCall) rexBuilder.makeCall(SqlLibraryOperators.REGEXP_REPLACE_3, List.of(field, pattern, replacement));
+
+        RexCall adapted = (RexCall) adapter.adapt(original, List.of(), cluster);
+
+        assertSame("operator stays REGEXP_REPLACE_3", SqlLibraryOperators.REGEXP_REPLACE_3, adapted.getOperator());
+        assertEquals("3 operands, no flag appended", 3, adapted.getOperands().size());
+        assertEquals("pattern unquoted", "^BUSINESS(.*?)$", ((RexLiteral) adapted.getOperands().get(1)).getValueAs(String.class));
+    }
+
+    // ── matchesAtMostOnce — when is "g" redundant ───────────────────────────────
+    // Expected values below were checked against the regex crate DataFusion uses by running
+    // replacen(s, 1, ..) and replacen(s, 0, ..) on the quoted inputs.
+
+    public void testMatchesAtMostOnceAcceptsStartAnchor() {
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^a"));
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^"));
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^a*"));
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^OFFICE.*$"));
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^https?://(?:www\\.)?([^/]+)/.*$"));
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^(\\w+) (\\w+)$"));
+    }
+
+    public void testMatchesAtMostOnceRejectsUnanchoredPattern() {
+        // 'at' on "cat hat bat": first-match "cog hat bat", replace-all "cog hog bog".
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("at"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("a$"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce(""));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce(null));
+        // \A also anchors, but the check only recognises '^'; keeping "g" there is merely unoptimized.
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("\\Aa"));
+    }
+
+    public void testMatchesAtMostOnceRejectsQuantifiedAnchor() {
+        // '^*a' on "aaa": first-match "Xaa", replace-all "XXX" (the regex crate accepts '^*').
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^*a"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^?a"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^{0,}a"));
+        // '^+*b' on "bbb": first-match "Xbb", replace-all "XXX". The stacked '*' allows zero anchors, so
+        // the pattern is just 'b'; any quantifier character right after '^' is declined.
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^+*b"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^+a"));
+    }
+
+    public void testMatchesAtMostOnceRejectsInlineFlags() {
+        // '^(?x)# (\na|b' is '^a|b' in verbose mode (the '#' starts a comment), and on "ab" gives
+        // first-match "Xb", replace-all "XX". A character scan sees a balanced group and no top-level
+        // '|', so any inline flag group is declined rather than modelling each flag.
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^(?x)# (\na|b"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^(?x) a | b"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^(?P<host>[^/]+)"));
+        // '^(?m)a' and '^(?i)A' do not diverge (a leading '^' is compiled before the flag applies),
+        // but they are declined by the same rule; keeping "g" there is merely unoptimized.
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^(?m)a"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^(?i)a"));
+    }
+
+    public void testMatchesAtMostOnceRejectsTopLevelAlternation() {
+        // '^a|b$' on "ab": first-match "Xb", replace-all "XX" (the 'b$' branch is not anchored).
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^a|b$"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^(a)|b"));
+    }
+
+    public void testMatchesAtMostOnceRejectsClassesItCannotDelimit() {
+        // In the regex crate a '[' that ends a range is a literal, so '^[.-[]|b' is the class '[.-[]'
+        // followed by a top-level '|b': on "bb" first-match "Xb", replace-all "XX". A scan that treats
+        // every inner '[' as a nested class would swallow the '|'.
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^[.-[]|b"));
+        // In the nested class '[]b]' the first ']' is a literal, so the outer class runs to the ']'
+        // after '(' and '|c' is top-level: on "cc" first-match "Xc", replace-all "XX".
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^[a[]b](]|c"));
+        // A ']' right after '[' is a literal member, so '^[](]|(b)[])]' is the class '[](]' followed by a
+        // top-level '|': on "b)b)" first-match "Xb)", replace-all "XX". A scan that closes the class at
+        // that ']' sees the '|' inside a group.
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^[](]|(b)[])]"));
+        // A '[' inside a class and a ']' as first member are declined outright, including the shapes
+        // that happen to be safe; keeping "g" there is merely unoptimized.
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^[a[|]]b"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^[]|]a"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^[^]|]a"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^[[:alpha:]]"));
+    }
+
+    public void testMatchesAtMostOnceRejectsMalformedPattern() {
+        // None of these compile, so the answer cannot matter; the scan declines rather than guess.
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^a\\"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^(a"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^a)"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^[a"));
+        assertFalse(RegexpReplaceAdapter.matchesAtMostOnce("^[^"));
+    }
+
+    public void testMatchesAtMostOnceAcceptsAlternationInsideGroupClassOrEscape() {
+        // '^(a|b)$' on "ab": no match either way; '^a\|b' and '^a[|]b' on "a|b": "X" both ways.
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^(a|b)$"));
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^(?:a|b)"));
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^a\\|b"));
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^a[|]b"));
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^a[^|]b"));
+        assertTrue(RegexpReplaceAdapter.matchesAtMostOnce("^a[\\]|]b"));
+    }
+
+    public void testAdaptKeepsGlobalFlagWhenSingleMatchCannotBeProven() {
+        // Each pattern matches more than once in the regex crate, so the 4-arg replace-all form must be
+        // kept: '^+*b' on "bbb" -> "XXX", '^[.-[]|b' on "bb" -> "XX", '^[a[]b](]|c' on "cc" -> "XX".
+        for (String pattern : List.of("^+*b", "^[.-[]|b", "^[a[]b](]|c")) {
+            RexNode field = rexBuilder.makeInputRef(varcharType, 0);
+            RexCall original = (RexCall) rexBuilder.makeCall(
+                SqlLibraryOperators.REGEXP_REPLACE_3,
+                List.of(field, rexBuilder.makeLiteral(pattern), rexBuilder.makeLiteral("X"))
+            );
+
+            RexCall adapted = (RexCall) adapter.adapt(original, List.of(), cluster);
+
+            assertSame(pattern + ": operator switched to PG_4", SqlLibraryOperators.REGEXP_REPLACE_PG_4, adapted.getOperator());
+            assertEquals(pattern + ": 4 operands after append", 4, adapted.getOperands().size());
+            assertEquals(pattern + ": trailing flag is \"g\"", "g", ((RexLiteral) adapted.getOperands().get(3)).getValueAs(String.class));
+        }
     }
 
     public void testAdaptAppendsGlobalFlagForNonLiteralPattern() {
