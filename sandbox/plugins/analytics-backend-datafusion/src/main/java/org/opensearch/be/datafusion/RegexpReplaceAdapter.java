@@ -21,7 +21,10 @@ import org.opensearch.analytics.spi.ScalarFunctionAdapter;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Adapts {@code REGEXP_REPLACE} for DataFusion: expand {@code \Q…\E}, brace {@code $N}, append "g" flag. */
+/**
+ * Adapts {@code REGEXP_REPLACE} for DataFusion: expand {@code \Q…\E}, brace {@code $N}, and append the "g"
+ * flag unless the pattern can match at most once (see {@link #matchesAtMostOnce}).
+ */
 class RegexpReplaceAdapter implements ScalarFunctionAdapter {
 
     private static final String REGEX_METACHARS = ".\\+*?^$()[]{}|/";
@@ -56,7 +59,14 @@ class RegexpReplaceAdapter implements ScalarFunctionAdapter {
             }
         }
 
-        boolean appendGlobalFlag = original.getOperator() == SqlLibraryOperators.REGEXP_REPLACE_3 && original.getOperands().size() == 3;
+        // REGEXP_REPLACE_3 replaces every match, DataFusion's 3-arg form only the first, so "g" is
+        // normally required. It is omitted when the pattern can match at most once, because the
+        // 3-arg form is the only one DataFusion optimizes (regexpreplace.rs builds its short-extract
+        // path only for limit == 1) and the two forms return the same string for such a pattern.
+        String effectivePattern = rewrittenPattern != null ? rewrittenPattern : literalString(patternOperand);
+        boolean appendGlobalFlag = original.getOperator() == SqlLibraryOperators.REGEXP_REPLACE_3
+            && original.getOperands().size() == 3
+            && matchesAtMostOnce(effectivePattern) == false;
 
         if (rewrittenPattern == null && rewrittenReplacement == null && !appendGlobalFlag) {
             return original;
@@ -76,6 +86,82 @@ class RegexpReplaceAdapter implements ScalarFunctionAdapter {
             return rexBuilder.makeCall(original.getType(), SqlLibraryOperators.REGEXP_REPLACE_PG_4, newOperands);
         }
         return rexBuilder.makeCall(original.getType(), original.getOperator(), newOperands);
+    }
+
+    private static String literalString(RexNode operand) {
+        return operand instanceof RexLiteral literal ? literal.getValueAs(String.class) : null;
+    }
+
+    /**
+     * True when {@code pattern} can match at most once in any input, so replacing the first match and
+     * replacing all matches give the same string. False when unsure; the caller then keeps "g", which is
+     * always correct.
+     *
+     * <p>Accepted: a pattern that starts with an unquantified {@code ^}, has no {@code |} outside a group,
+     * no inline flag group, and only character classes without a nested {@code [} or a leading {@code ]}.
+     * Such a pattern can match at offset 0 only. Declined, each with an input on which first-match and
+     * replace-all differ (pinned by {@code RegexpReplaceAdapterTests}):
+     * <ul>
+     *   <li>a quantifier on the anchor: {@code ^*a} on {@code "aaa"} gives {@code Xaa} vs {@code XXX};
+     *       {@code ^+*b} on {@code "bbb"} gives {@code Xbb} vs {@code XXX}</li>
+     *   <li>a top-level {@code |}, whose other branch escapes the anchor: {@code ^a|b$} on {@code "ab"}
+     *       gives {@code Xb} vs {@code XX}</li>
+     *   <li>an inline flag group, which changes how the rest is read: under {@code (?x)} a {@code #} starts
+     *       a comment, so {@code ^(?x)# (\na|b} is {@code ^a|b} and on {@code "ab"} gives {@code Xb} vs
+     *       {@code XX}</li>
+     *   <li>a {@code [} inside a class or a {@code ]} as its first member: where such a class ends follows
+     *       nesting and range rules this scan does not model: {@code ^[.-[]|b} on {@code "bb"} gives
+     *       {@code Xb} vs {@code XX}; {@code ^[a[]b](]|c} on {@code "cc"} gives {@code Xc} vs {@code XX}</li>
+     *   <li>a malformed pattern (trailing backslash, unbalanced group or class): it fails to compile either
+     *       way</li>
+     * </ul>
+     */
+    static boolean matchesAtMostOnce(String pattern) {
+        if (pattern == null || pattern.isEmpty() || pattern.charAt(0) != '^' || "*+?{".indexOf(peek(pattern, 1)) >= 0) {
+            return false;
+        }
+        int groupDepth = 0;
+        boolean inClass = false;
+        for (int i = 1; i < pattern.length(); i++) {
+            char c = pattern.charAt(i);
+            if (c == '\\') {
+                if (++i == pattern.length()) {
+                    return false;
+                }
+            } else if (inClass) {
+                if (c == '[') {
+                    return false;
+                }
+                if (c == ']') {
+                    inClass = false;
+                }
+            } else if (c == '[') {
+                inClass = true;
+                if (peek(pattern, i + 1) == '^') {
+                    i++;
+                }
+                if (peek(pattern, i + 1) == ']') {
+                    return false;
+                }
+            } else if (c == '(') {
+                if (peek(pattern, i + 1) == '?' && peek(pattern, i + 2) != ':') {
+                    return false;
+                }
+                groupDepth++;
+            } else if (c == ')') {
+                if (--groupDepth < 0) {
+                    return false;
+                }
+            } else if (c == '|' && groupDepth == 0) {
+                return false;
+            }
+        }
+        return inClass == false && groupDepth == 0;
+    }
+
+    /** The character at {@code index}, or -1 past the end, so lookahead needs no bounds check. */
+    private static int peek(String s, int index) {
+        return index < s.length() ? s.charAt(index) : -1;
     }
 
     /** Wrap bare {@code $N} backreferences in braces, preserving {@code $$} and {@code ${…}}. */
